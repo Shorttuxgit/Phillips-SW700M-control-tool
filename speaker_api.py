@@ -1,5 +1,6 @@
 import socket
 import time
+import uuid
 import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -17,7 +18,6 @@ class _SpeakerListener(ServiceListener):
     def add_service(self, zc, type_, name):
         info = zc.get_service_info(type_, name)
         if info:
-            # Check TXT records for Frontier Silicon's signature path
             props = {
                 k.decode("utf-8", errors="ignore"): v.decode("utf-8", errors="ignore")
                 for k, v in info.properties.items()
@@ -25,7 +25,7 @@ class _SpeakerListener(ServiceListener):
             }
             if props.get("CPath") == "/goform/spotifyConfig":
                 for addr in info.parsed_addresses():
-                    if "." in addr:  # IPv4 only
+                    if "." in addr:
                         self.found_ips.add(addr)
 
     def update_service(self, zc, type_, name):
@@ -40,7 +40,7 @@ def discover_speakers(timeout=2.5):
     speakers = {}
     zc = Zeroconf()
     listener = _SpeakerListener()
-    browser = ServiceBrowser(zc, "_spotify-connect._tcp.local.", listener)
+    ServiceBrowser(zc, "_spotify-connect._tcp.local.", listener)
 
     time.sleep(timeout)
     zc.close()
@@ -50,7 +50,6 @@ def discover_speakers(timeout=2.5):
         if name:
             speakers[name] = ip
 
-    # Fallback: if mDNS is blocked by a firewall, scan the local /24 subnet directly
     if not speakers:
         speakers = _subnet_fallback_scan()
 
@@ -58,7 +57,6 @@ def discover_speakers(timeout=2.5):
 
 
 def _get_local_subnet_prefix():
-    """Detects the active local IPv4 subnet (e.g., '192.168.0.')."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
@@ -131,6 +129,19 @@ def set_node(ip, node, value, pin=DEFAULT_PIN):
     root = _request(f"http://{ip}/fsapi/SET/{node}?pin={pin}&sid={sid}&value={encoded_val}")
     delete_session(ip, sid, pin)
     return root is not None and root.findtext("status") == "FS_OK"
+
+
+def _set_node_debug(ip, node, value, pin=DEFAULT_PIN):
+    sid = create_session(ip, pin)
+    if not sid:
+        return False, "NO_SESSION"
+    encoded_val = urllib.parse.quote(str(value))
+    root = _request(f"http://{ip}/fsapi/SET/{node}?pin={pin}&sid={sid}&value={encoded_val}")
+    delete_session(ip, sid, pin)
+    if root is None:
+        return False, "HTTP_ERROR"
+    status = root.findtext("status")
+    return (status == "FS_OK"), status
 
 
 # --- System & Identity ---
@@ -206,30 +217,120 @@ def get_now_playing(ip, pin=DEFAULT_PIN):
 
 # --- Multiroom Grouping ---
 
-def get_group_state(ip, pin=DEFAULT_PIN):
-    return get_node(ip, "netRemote.multiroom.group.state", "u8", pin)
+def get_peer_devices(ip, pin=DEFAULT_PIN):
+    """Reads netRemote.multiroom.device.listAll to get peer UDNs, IPs, and group roles."""
+    sid = create_session(ip, pin)
+    if not sid:
+        return []
+    root = _request(
+        f"http://{ip}/fsapi/LIST_GET_NEXT/netRemote.multiroom.device.listAll/-1?pin={pin}&sid={sid}&maxItems=20"
+    )
+    delete_session(ip, sid, pin)
+    peers = []
+    if root is not None:
+        for item in root.findall(".//item"):
+            entry = {}
+            for field in item.findall("field"):
+                fname = field.attrib.get("name", "").lower()
+                val = "".join(field.itertext()).strip()
+                entry[fname] = val
+            peers.append(entry)
+    return peers
+
+
+def get_udn_for_target(observer_ip, target_ip, pin=DEFAULT_PIN):
+    for peer in get_peer_devices(observer_ip, pin):
+        if peer.get("ipaddress") == target_ip:
+            udn = peer.get("udn")
+            if udn:
+                return udn
+    for peer in get_peer_devices(target_ip, pin):
+        udn = peer.get("udn")
+        if udn and peer.get("ipaddress") == target_ip:
+            return udn
+    return None
 
 
 def get_group_id(ip, pin=DEFAULT_PIN):
     return get_node(ip, "netRemote.multiroom.group.id", "c8_array", pin)
 
 
-def group_speakers(master_ip, client_ip, pin=DEFAULT_PIN):
-    if get_group_state(master_ip, pin) != "1":
-        set_node(master_ip, "netRemote.multiroom.group.state", 1, pin)
+def get_group_role(target_ip, peer_ip=None, pin=DEFAULT_PIN):
+    if peer_ip:
+        for peer in get_peer_devices(peer_ip, pin):
+            if peer.get("ipaddress") == target_ip:
+                return peer.get("grouprole", "0")
+    gid = get_group_id(target_ip, pin)
+    return "Grouped" if gid else "0"
 
-    group_id = get_group_id(master_ip, pin)
-    if not group_id:
+
+def debug_multiroom(ip, pin=DEFAULT_PIN):
+    candidate_nodes = [
+        "netRemote.sys.info.version",
+        "netRemote.multiroom.caps.maxClients",
+        "netRemote.multiroom.caps.protocolVersion",
+        "netRemote.multiroom.group.id",
+        "netRemote.multiroom.group.create",
+        "netRemote.multiroom.group.destroy",
+        "netRemote.multiroom.group.addClient",
+        "netRemote.multiroom.group.removeClient",
+    ]
+    sid = create_session(ip, pin)
+    if not sid:
+        print(f"  Could not create session on {ip}")
+        return
+
+    print(f"\n  --- Multiroom Node Scan for {ip} ---")
+    for node in candidate_nodes:
+        root = _request(f"http://{ip}/fsapi/GET/{node}?pin={pin}&sid={sid}")
+        if root is not None:
+            status = root.findtext("status")
+            val_el = root.find("value")
+            val_str = ET.tostring(val_el, encoding="unicode").strip() if val_el is not None else ""
+            print(f"  [{status}] {node} {val_str}")
+
+    delete_session(ip, sid, pin)
+
+    peers = get_peer_devices(ip, pin)
+    print(f"  Discovered Peers visible to {ip}:")
+    for p in peers:
+        print(f"    - {p.get('friendlyname')} | IP: {p.get('ipaddress')} | UDN: {p.get('udn')} | Role: {p.get('grouprole')} | GroupID: {p.get('groupid')}")
+    print()
+
+
+def group_speakers(master_ip, client_ip, group_name="Multiroom", pin=DEFAULT_PIN):
+    set_power(master_ip, 1, pin)
+    set_power(client_ip, 1, pin)
+
+    client_udn = get_udn_for_target(master_ip, client_ip, pin)
+    print(f"  [Info] Target Client IP: {client_ip} | Resolved Client UDN: {client_udn}")
+
+    if not client_udn:
+        print("  [Error] Could not resolve client speaker UDN. Make sure both speakers are powered on.")
         return False
 
-    set_node(client_ip, "netRemote.multiroom.group.state", 2, pin)
-    ok_client = set_node(client_ip, "netRemote.multiroom.group.id", group_id, pin)
-    ok_master = set_node(master_ip, "netRemote.multiroom.group.addClient", client_ip, pin)
-    return ok_client or ok_master
+    _set_node_debug(master_ip, "netRemote.multiroom.group.create", group_name, pin)
+    time.sleep(0.4)
+    group_id = get_group_id(master_ip, pin)
+
+    if not group_id:
+        group_id = str(uuid.uuid4()).upper()
+        _set_node_debug(master_ip, "netRemote.multiroom.group.id", group_id, pin)
+
+    print(f"  [Step 1] Master group.id active: {group_id}")
+
+    ok_add, st_add = _set_node_debug(master_ip, "netRemote.multiroom.group.addClient", client_udn, pin)
+    print(f"  [Step 2] Master addClient({client_udn}): {st_add}")
+
+    time.sleep(0.8)
+    role = get_group_role(client_ip, peer_ip=master_ip, pin=pin)
+    print(f"  [Verify] Client grouprole is now: {role} (2 = Client, 1 = Master, 0 = Ungrouped)")
+    return ok_add
 
 
-def ungroup_speakers(master_ip, client_ip, pin=DEFAULT_PIN):
-    set_node(master_ip, "netRemote.multiroom.group.removeClient", client_ip, pin)
-    ok_client = set_node(client_ip, "netRemote.multiroom.group.state", 0, pin)
-    set_node(master_ip, "netRemote.multiroom.group.state", 0, pin)
-    return ok_client
+def ungroup_speaker(ip, pin=DEFAULT_PIN):
+    """Resets an individual speaker back to standalone mode."""
+    _set_node_debug(ip, "netRemote.multiroom.group.id", "", pin)
+    _set_node_debug(ip, "netRemote.multiroom.group.destroy", 1, pin)
+    time.sleep(0.3)
+    return not get_group_id(ip, pin)

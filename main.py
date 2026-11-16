@@ -36,7 +36,7 @@ def prompt_speaker(speakers, prompt_text="Which speaker?"):
         return None, None
 
     names = list(speakers.keys())
-    print(f"\n  Available speakers:")
+    print("\n  Available speakers:")
     for idx, name in enumerate(names, start=1):
         print(f"    {idx}. {name} ({speakers[name]})")
 
@@ -45,14 +45,12 @@ def prompt_speaker(speakers, prompt_text="Which speaker?"):
         print("  Cancelled.")
         return None, None
 
-    # Allow selecting by number (e.g., "1")
     if choice.isdigit():
         idx = int(choice) - 1
         if 0 <= idx < len(names):
             selected = names[idx]
             return selected, speakers[selected]
 
-    # Allow selecting by exact or case-insensitive name with spaces (e.g., "Dining Room")
     for name, ip in speakers.items():
         if name.lower() == choice.lower():
             return name, ip
@@ -68,7 +66,7 @@ Available Commands (just type the command and follow the prompts):
   scan      - Re-scan the network for speakers
   rename    - Rename a speaker (supports spaces like "Dining Room")
   group     - Link two speakers together for multiroom playback
-  ungroup   - Separate two grouped speakers
+  ungroup   - Automatically detect active groups and ungroup them
   volume    - Change a speaker's volume (0-20)
   power     - Turn a speaker on or put it into standby
   mute      - Mute or unmute a speaker
@@ -76,7 +74,8 @@ Available Commands (just type the command and follow the prompts):
   pause     - Pause playback on a speaker
   next      - Skip to the next track
   prev      - Go back to the previous track
-  status    - Check power, volume, group state & current track
+  status    - Check power, volume, group role & current track
+  debug     - Scan multiroom nodes & peer table on a speaker
   help      - Show this menu
   exit      - Quit
 """)
@@ -161,16 +160,50 @@ def main():
             print(f"  Grouped '{m_name}' + '{c_name}': {'Success' if ok else 'Failed'}")
 
         elif cmd == "ungroup":
-            m_name, m_ip = prompt_speaker(speakers, "Select the MAIN (master) speaker")
-            if not m_ip:
+            # Scan network for active groups
+            active_groups = {}
+            for name, ip in speakers.items():
+                gid = api.get_group_id(ip)
+                if gid:
+                    if gid not in active_groups:
+                        active_groups[gid] = []
+                    active_groups[gid].append((name, ip))
+
+            if not active_groups:
+                print("\n  No active multiroom groups found (all speakers are standalone).")
                 continue
 
-            c_name, c_ip = prompt_speaker(speakers, f"Select the speaker to unlink from '{m_name}'")
-            if not c_ip:
+            print("\n  Active Multiroom Groups:")
+            group_keys = list(active_groups.keys())
+            for idx, gid in enumerate(group_keys, start=1):
+                member_names = ", ".join([m[0] for m in active_groups[gid]])
+                print(f"    {idx}. multiroom: {member_names}")
+
+            choice = input("  Select group to ungroup (enter number): ").strip()
+            if not choice.isdigit():
+                print("  Cancelled.")
                 continue
 
-            ok = api.ungroup_speakers(m_ip, c_ip)
-            print(f"  Ungrouped '{m_name}' and '{c_name}': {'Success' if ok else 'Failed'}")
+            g_idx = int(choice) - 1
+            if 0 <= g_idx < len(group_keys):
+                selected_gid = group_keys[g_idx]
+                members = active_groups[selected_gid]
+                
+                print("  Ungrouping members...")
+                success_count = 0
+                for name, ip in members:
+                    if api.ungroup_speaker(ip):
+                        success_count += 1
+                        print(f"    - Ungrouped '{name}'")
+                    else:
+                        print(f"    - Failed to ungroup '{name}'")
+                
+                if success_count > 0:
+                    print("  Ungrouped successfully!")
+                else:
+                    print("  Failed to ungroup group.")
+            else:
+                print("  Invalid selection.")
 
         elif cmd in ("volume", "vol"):
             name, ip = prompt_speaker(speakers, "Which speaker's volume do you want to change?")
@@ -234,14 +267,23 @@ def main():
             if not ip:
                 continue
 
+            peer_ips = [other_ip for other_ip in speakers.values() if other_ip != ip]
+            peer_ip = peer_ips[0] if peer_ips else None
+
             np = api.get_now_playing(ip)
-            group_map = {"0": "Standalone (Ungrouped)", "1": "Group Master", "2": "Group Client"}
-            g_state = api.get_group_state(ip)
+            role_map = {"0": "Standalone (Ungrouped)", "1": "Group Master", "2": "Group Client"}
+            role = api.get_group_role(ip, peer_ip=peer_ip)
             print(f"\n  --- {name} ({ip}) ---")
-            print(f"    Power:  {'On' if api.get_power(ip) == '1' else 'Standby'}")
-            print(f"    Volume: {api.get_volume(ip)} (Muted: {'Yes' if api.get_mute(ip) == '1' else 'No'})")
-            print(f"    Group:  {group_map.get(g_state, g_state)} (ID: {api.get_group_id(ip)})")
-            print(f"    Track:  {np['track']} - {np['artist']}\n")
+            print(f"    Power:    {'On' if api.get_power(ip) == '1' else 'Standby'}")
+            print(f"    Volume:   {api.get_volume(ip)} (Muted: {'Yes' if api.get_mute(ip) == '1' else 'No'})")
+            print(f"    Role:     {role_map.get(role, role)}")
+            print(f"    Group ID: {api.get_group_id(ip) or '(none)'}")
+            print(f"    Track:    {np['track']} - {np['artist']}\n")
+
+        elif cmd == "debug":
+            name, ip = prompt_speaker(speakers, "Which speaker do you want to inspect?")
+            if ip:
+                api.debug_multiroom(ip)
 
         else:
             print(f"  Unknown command '{cmd}'. Type 'help' to see available commands.")

@@ -5,3 +5,6 @@ The tool automatically downloads the zeroconf python package.
 ## Supported Operating Systems
 * Ubuntu - Tested Fully Working
 * Windows - Untested
+
+## Setup
+Ensure system is up to date and that the latest version of Pip is installed. Running main.py installs all dependencies automatically. 
